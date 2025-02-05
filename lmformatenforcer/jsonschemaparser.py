@@ -22,6 +22,7 @@ class JsonSchemaParser(CharacterLevelParser):
         active_parser: "JsonSchemaParser"
         alphabet_without_quotes: str
         regex_parser_cache: Dict[str, RegexParser] = {}
+        regex_pattern_cache: Dict[str, List[int]] = {}  # Changed from RegexParser to List[int]
 
     object_stack: List[CharacterLevelParser]
     context: _Context
@@ -45,6 +46,7 @@ class JsonSchemaParser(CharacterLevelParser):
             self.context.model_class = JsonSchemaObject(**json_schema)
             self.context.active_parser = self
             self.context.alphabet_without_quotes = self.config.alphabet.replace('"', '')
+            self.context.regex_pattern_cache = {}
         
         self.num_consecutive_whitespaces = num_consecutive_whitespaces
         if existing_stack is None:
@@ -152,6 +154,13 @@ class JsonSchemaParser(CharacterLevelParser):
                     if cur_len < max_len:
                         return ('json_freetext', cur_len, min_len, max_len)
         return None
+
+    def get_or_create_regex_parser(self, pattern: str) -> RegexParser:
+        """Helper method to get or create a regex parser with caching"""
+        if pattern not in self.context.regex_parser_cache:
+            parser = RegexParser(pattern, self.config)
+            self.context.regex_parser_cache[pattern] = parser
+        return self.context.regex_parser_cache[pattern]
 
 
 class BaseParsingState(CharacterLevelParser):
@@ -533,10 +542,22 @@ class StringParsingState(PrimitiveParsingState):
             raise LMFormatEnforcerException("String schema contains both a pattern and a min/max length, which is not currently supported")
         self.regex_parser = regex_parser
         if self.pattern and not regex_parser:
-            if self.pattern not in self.root.context.regex_parser_cache:
-                self.root.context.regex_parser_cache[self.pattern] = RegexParser(self.pattern, self.root.config)
-            self.regex_parser = self.root.context.regex_parser_cache[self.pattern]
+            self.regex_parser = self.root.get_or_create_regex_parser(self.pattern)
 
+    def shortcut_key(self) -> Optional[Hashable]:
+        if self.regex_parser and self.seen_opening_quote and not self.seen_closing_quote:
+            return self.regex_parser.shortcut_key()
+        elif not self.allowed_strings and self.seen_opening_quote and not self.seen_closing_quote and not self.regex_parser:
+            # Performance optimization: When we are parsing a string that is not from a list of allowed strings, most tokens
+            # are legal. The exploration can be more costly than the LM itself for large tokenizers (because this is pure python),
+            # so we signal that we are in a "freetext" mode, and reuse the allowed token list throughout the run.
+            cur_len = len(self.parsed_string)
+            min_len = self.min_length or 0
+            max_len = self.max_length or sys.maxsize
+            assert min_len <= max_len, "Invalid schema for str: min length is larger than max length"
+            if cur_len < max_len:
+                return ('json_freetext', cur_len, min_len, max_len)
+        return None
 
     def _clone(self) -> "StringParsingState":
         clone = StringParsingState(

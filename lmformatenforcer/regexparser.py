@@ -1,4 +1,4 @@
-from typing import Dict, Hashable, Optional, Union, List
+from typing import Dict, Hashable, Optional, Union, List, Tuple
 import interegular
 from interegular.fsm import anything_else
 
@@ -14,9 +14,15 @@ class RegexParser(CharacterLevelParser):
         pattern: interegular.FSM
         anything_else_characters: str
         state_character_cache: Dict[int, str]
+        state_token_cache: Dict[int, List[int]] = {}  # Cache allowed tokens per FSM state
+        transition_cache: Dict[Tuple[int, str], int] = {}  # Cache state transitions
+        anything_else_transition: Optional[int] = None  # Cache anything_else transition
     
     context: _Context
     current_state: int
+    pattern: Union[str, None]
+    pattern_hash: Union[int, None]
+    parsed_string: str
 
     def __init__(self, pattern: Union[str, _Context], config: Optional[CharacterLevelParserConfig] = None, current_state: int = UNINITIALIZED_STATE):
         super().__init__(config)
@@ -25,34 +31,59 @@ class RegexParser(CharacterLevelParser):
             self.context.pattern = interegular.parse_pattern(pattern).to_fsm()
             self.context.state_character_cache = {}
             self._update_alphabet(self.config.alphabet)
+            self.pattern = pattern
+            self.pattern_hash = hash(pattern)
+            self.parsed_string = ""
         else:
             self.context = pattern
-        self.current_state: int = self.context.pattern.initial if current_state == RegexParser.UNINITIALIZED_STATE else current_state
+            self.pattern = pattern.pattern if hasattr(pattern, 'pattern') else None
+            self.pattern_hash = hash(self.pattern) if self.pattern else None
+            self.parsed_string = ""
+        self.current_state = self.context.pattern.initial if current_state == RegexParser.UNINITIALIZED_STATE else current_state
 
     def add_character(self, new_character: str) -> 'RegexParser':
         if self.current_state == RegexParser.INVALID_STATE:
             return self
-        
-        state = self.current_state
-        fsm = self.context.pattern
-        # Mostly taken from FSM.accept()
-        symbol = new_character
-        if anything_else in fsm.alphabet and not symbol in fsm.alphabet:
-            symbol = anything_else
-        transition = fsm.alphabet[symbol]
 
-        try:
-            # Prefer try-catch to checking if transition exists to avoid double lookup perf hit in valid case
-            state = fsm.map[state][transition]  # type: ignore
-            return RegexParser(self.context, self.config, state)
-        except KeyError:
-            # Missing transition = transition to dead state
-            return RegexParser(self.context, self.config, RegexParser.INVALID_STATE)
+        # Check transition cache first
+        cache_key = (self.current_state, new_character)
+        if cache_key in self.context.transition_cache:
+            next_state = self.context.transition_cache[cache_key]
+        else:
+            fsm = self.context.pattern
+            try:
+                # Try direct character transition first
+                if new_character in fsm.alphabet:
+                    transition = fsm.alphabet[new_character]
+                    next_state = fsm.map[self.current_state][transition]
+                # Fall back to anything_else if needed
+                elif anything_else in fsm.alphabet:
+                    if self.context.anything_else_transition is None:
+                        self.context.anything_else_transition = fsm.alphabet[anything_else]
+                    next_state = fsm.map[self.current_state][self.context.anything_else_transition]
+                else:
+                    next_state = RegexParser.INVALID_STATE
+                
+                # Cache the transition
+                self.context.transition_cache[cache_key] = next_state
+            except KeyError:
+                next_state = RegexParser.INVALID_STATE
+                self.context.transition_cache[cache_key] = next_state
+
+        # Create new parser with cached state
+        new_parser = RegexParser(self.context, self.config, next_state)
+        new_parser.pattern = self.pattern
+        new_parser.pattern_hash = self.pattern_hash
+        new_parser.parsed_string = self.parsed_string + new_character
+        return new_parser
     
     def can_end(self) -> bool:
         return self.current_state in self.context.pattern.finals or self.current_state == RegexParser.INVALID_STATE
     
     def get_allowed_characters(self) -> str:
+        # Only compute allowed characters if we don't have a token cache for this state
+        if self.current_state in self.context.state_token_cache:
+            return ''  # Skip character exploration if we have cached tokens
         if self.current_state not in self.context.pattern.map:
             return ''
         if self.current_state not in self.context.state_character_cache:
@@ -70,7 +101,9 @@ class RegexParser(CharacterLevelParser):
     
     def cache_key(self) -> Optional[Hashable]:
         # If we are in the same regex fsm state, the allowed next tokens are the same ones
-        return self.current_state
+        if self.current_state == RegexParser.INVALID_STATE:
+            return None
+        return ('regex_state', self.pattern_hash, self.current_state)
 
     def _update_alphabet(self, new_alphabet: str):
         if self.context:
@@ -81,5 +114,10 @@ class RegexParser(CharacterLevelParser):
     def config(self, new_config: CharacterLevelParserConfig):
         CharacterLevelParser.config.fset(self, new_config)  # Original set
         self._update_alphabet(new_config.alphabet)
+
+    def shortcut_key(self) -> Optional[Hashable]:
+        if self.pattern is None:
+            return None
+        return ('regex_pattern', self.pattern_hash, len(self.parsed_string))
 
 
